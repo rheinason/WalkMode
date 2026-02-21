@@ -526,7 +526,7 @@ namespace WalkMode
             {
                 _redrawPending = false;
                 ApplyCamera();
-                AdjustNearClip();
+                AdjustFrustum();
                 _view.Redraw();
             }
         }
@@ -677,17 +677,23 @@ namespace WalkMode
         void ApplyCamera()
         {
             var dir = ReconstructCameraDirection();
-            _vp.SetCameraLocations(_camPos + dir, _camPos);
+            // Place target far enough from the camera so Rhino's auto-frustum
+            // calculation doesn't collapse (it bases near/far on camera-to-target
+            // distance).  Also gives a useful target distance on accept.
+            double targetDist = Math.Max(_baseSpeed * 10, 10.0 * _unitsPerMeter);
+            _vp.SetCameraLocations(_camPos + dir * targetDist, _camPos);
         }
 
-        void AdjustNearClip()
+        void AdjustFrustum()
         {
+            // Rhino's auto-frustum (triggered by SetCameraLocations) bases
+            // near/far on scene extents.  In mm or cm files this pushes the
+            // near plane so far out that nearby walls — or even the whole
+            // scene — get clipped.  Always force our own near/far.
             var vi = new ViewportInfo(_vp);
-            if (vi.FrustumNear > _nearClip * 2)
-            {
-                vi.SetFrustumNearFar(_nearClip, vi.FrustumFar);
-                _vp.SetViewProjection(vi, false);
-            }
+            double far = Math.Max(vi.FrustumFar, _nearClip * 1e6);
+            vi.SetFrustumNearFar(_nearClip, far);
+            _vp.SetViewProjection(vi, false);
         }
 
         // ── Entry point ───────────────────────────────────────────────────────
