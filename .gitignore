@@ -1,7 +1,11 @@
 bin/
 obj/
 .vs/
+.vscode/
+.dotnet/
+.claude/
 *.user
 *.suo
 *.cache
 *.DotSettings.user
+*.yak
