@@ -25,10 +25,7 @@ namespace WalkMode
 
             using (var walker = new WalkGetter(doc, view))
             {
-                var walkResult = walker.RunWalk();
-                return walkResult == Rhino.Input.GetResult.Cancel
-                    ? Result.Cancel
-                    : Result.Success;
+                return walker.RunWalk();
             }
         }
     }

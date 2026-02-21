@@ -4,22 +4,19 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
 using Rhino;
+using Rhino.Commands;
 using Rhino.Display;
 using Rhino.DocObjects;
 using Rhino.DocObjects.Tables;
 using Rhino.Geometry;
 using Rhino.Geometry.Intersect;
-using Rhino.Input;
-using Rhino.Input.Custom;
 
 namespace WalkMode
 {
-    internal sealed class WalkGetter : GetPoint
+    internal sealed class WalkGetter : IDisposable
     {
         // ── P/Invoke ──────────────────────────────────────────────────────────
         [DllImport("user32.dll")]  static extern bool   SetCursorPos(int x, int y);
-        // Win32 ShowCursor is reference-counted; Cursor.Hide() only calls it once
-        // which may not be enough if Rhino has incremented the count internally.
         [DllImport("user32.dll", EntryPoint = "ShowCursor")]
         static extern int ShowCursorWin32(bool bShow);
         [DllImport("user32.dll")]  static extern bool   ClientToScreen(IntPtr hWnd, ref System.Drawing.Point lpPoint);
@@ -27,9 +24,31 @@ namespace WalkMode
         [DllImport("user32.dll")]  static extern bool   UnhookWindowsHookEx(IntPtr hhk);
         [DllImport("user32.dll")]  static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
         [DllImport("kernel32.dll")] static extern IntPtr GetModuleHandle(string lpModuleName);
-        // Multimedia timer resolution — lets WinForms timer fire at 1 ms granularity
         [DllImport("winmm.dll")]   static extern int    timeBeginPeriod(int uPeriod);
         [DllImport("winmm.dll")]   static extern int    timeEndPeriod(int uPeriod);
+
+        // Message pump P/Invokes
+        [DllImport("user32.dll")]
+        static extern bool PeekMessage(out MSG lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax, uint wRemoveMsg);
+        [DllImport("user32.dll")]
+        static extern bool TranslateMessage(ref MSG lpMsg);
+        [DllImport("user32.dll")]
+        static extern IntPtr DispatchMessage(ref MSG lpMsg);
+        [DllImport("user32.dll")]
+        static extern bool WaitMessage();
+
+        const uint PM_REMOVE = 0x0001;
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct MSG
+        {
+            public IntPtr hwnd;
+            public uint   message;
+            public IntPtr wParam;
+            public IntPtr lParam;
+            public uint   time;
+            public POINT  pt;
+        }
 
         // Low-level hook IDs and message codes
         const int WH_KEYBOARD_LL = 13;
@@ -37,6 +56,7 @@ namespace WalkMode
         const int WM_KEYDOWN     = 0x0100;
         const int WM_KEYUP       = 0x0101;
         const int WM_MOUSEMOVE   = 0x0200;
+        const int WM_RBUTTONDOWN = 0x0204;
         const int WM_MOUSEWHEEL  = 0x020A;
 
         delegate IntPtr LowLevelProc(int nCode, IntPtr wParam, IntPtr lParam);
@@ -73,30 +93,27 @@ namespace WalkMode
 
         // ── Cursor / screen centre ────────────────────────────────────────────
         System.Drawing.Point     _screenCenter;
-        System.Drawing.Point     _lastMousePt;   // last known cursor pos; hook measures delta from this
+        System.Drawing.Point     _lastMousePt;
         System.Drawing.Rectangle _lastBounds;
-        // No cursor-hide count needed — we force the Win32 display counter
-        // to exactly -1 every tick (hidden) and back to 0 in Cleanup (visible).
 
         // ── Frame timing ──────────────────────────────────────────────────────
         readonly Stopwatch _sw = Stopwatch.StartNew();
         long _lastTickMs;
 
         // ── Input state — written by hook callbacks, read by physics tick ─────
-        // Accumulated mouse deltas (hook writes, timer reads+clears)
         int _mouseDx, _mouseDy;
-        // Held-down keys
         bool _kW, _kA, _kS, _kD, _kQ, _kE, _kShift, _kAlt;
-        // One-shot edges (set on keydown in hook, cleared after being consumed)
         bool _tabEdge, _vEdge, _spaceEdge;
-        // Previous-down state for edge detection inside the hook
         bool _kTabDown, _kVDown, _kSpaceDown;
+
+        // ── Exit flags (replace GetPoint's Get() return) ─────────────────────
+        bool _exitRequested;
+        bool _cancelled;
 
         // ── Gravity ───────────────────────────────────────────────────────────
         bool   _gravityEnabled;
         double _verticalVelocity;
         bool   _grounded;
-        // Floor probe decimation — raycasts run at ~30 Hz, not every tick
         double _gravityProbeAccum;
         double _lastFloorZ;
         bool   _lastFloorValid;
@@ -105,41 +122,99 @@ namespace WalkMode
         bool     _teleporting;
         Point3d  _teleportOrigin, _teleportTarget;
         DateTime _teleportStart;
-        double   _teleportDuration;   // distance-based, set in BeginTeleport
+        double   _teleportDuration;
 
         // ── Scene geometry ────────────────────────────────────────────────────
-        // All geometry is stored as meshes (render meshes extracted from Breps).
-        // MeshRay needs no BVH warmup, so startup and first teleport are instant.
         Mesh[]   _meshGeometry;
         bool     _geometryDirty;
-        DateTime _lastGeometryRebuild; // debounce: rebuild at most every 500 ms
+        DateTime _lastGeometryRebuild;
 
-        // ── Render throttle ──────────────────────────────────────────────────
+        // ── Render state ────────────────────────────────────────────────────
         bool _redrawPending;
-        long _lastRedrawDoneMs;
 
-        // ── Near clip plane (doc units) — prevents walk-through clipping ────
+        // ── Near clip plane (doc units) ───────────────────────────────────────
         double _nearClip;
 
-        // ── Doc event delegates (stored for unsubscribe) ──────────────────────
+        // ── Doc event delegates ─────────────────────────────────────────────
         EventHandler<RhinoObjectEventArgs>                 _objHandler;
         EventHandler<RhinoReplaceObjectEventArgs>          _replaceHandler;
         EventHandler<RhinoModifyObjectAttributesEventArgs> _attrHandler;
         EventHandler<LayerTableEventArgs>                  _layerHandler;
 
         // ── Low-level hooks ───────────────────────────────────────────────────
-        LowLevelProc _hookProc;   // MUST be a field — prevents GC while the hook is live
+        LowLevelProc _hookProc;
         IntPtr       _kHook = IntPtr.Zero;
         IntPtr       _mHook = IntPtr.Zero;
 
         // ── Physics/render timer ──────────────────────────────────────────────
         System.Windows.Forms.Timer _timer;
 
+        // ── Display conduit ───────────────────────────────────────────────────
+        WalkConduit _conduit;
+
         // ── Disposal guard ────────────────────────────────────────────────────
         bool _cleaned;
 
-        // ── Sticky speed — persists across command invocations ────────────────
+        // ── Sticky speed ──────────────────────────────────────────────────────
         static double s_lastSpeed = 0;
+
+        // ── Display conduit for crosshair + status HUD ────────────────────────
+        sealed class WalkConduit : DisplayConduit
+        {
+            readonly WalkGetter _owner;
+            readonly Guid       _vpId;
+
+            public WalkConduit(WalkGetter owner)
+            {
+                _owner = owner;
+                _vpId  = owner._vp.Id;
+            }
+
+            protected override void DrawForeground(DrawEventArgs e)
+            {
+                if (e.Viewport.Id != _vpId) return;
+
+                DrawCrosshair(e);
+                DrawStatus(e);
+            }
+
+            void DrawCrosshair(DrawEventArgs e)
+            {
+                int cx = _owner._vp.Bounds.Width  / 2;
+                int cy = _owner._vp.Bounds.Height / 2;
+
+                const int   arm = 12;
+                const int   gap = 4;
+                const float thk = 1.5f;
+                var white = System.Drawing.Color.White;
+
+                e.Display.Draw2dLine(
+                    new System.Drawing.PointF(cx,       cy - gap),
+                    new System.Drawing.PointF(cx,       cy - gap - arm), white, thk);
+                e.Display.Draw2dLine(
+                    new System.Drawing.PointF(cx,       cy + gap),
+                    new System.Drawing.PointF(cx,       cy + gap + arm), white, thk);
+                e.Display.Draw2dLine(
+                    new System.Drawing.PointF(cx - gap, cy),
+                    new System.Drawing.PointF(cx - gap - arm, cy),       white, thk);
+                e.Display.Draw2dLine(
+                    new System.Drawing.PointF(cx + gap, cy),
+                    new System.Drawing.PointF(cx + gap + arm, cy),       white, thk);
+                e.Display.Draw2dLine(
+                    new System.Drawing.PointF(cx - 1, cy),
+                    new System.Drawing.PointF(cx + 1, cy), white, 2.0f);
+            }
+
+            void DrawStatus(DrawEventArgs e)
+            {
+                double speedMs = _owner._baseSpeed / _owner._unitsPerMeter;
+                string grav    = _owner._gravityEnabled ? "Gravity ON" : "Gravity OFF";
+                string text    = $"{grav}   Speed {speedMs:F1} m/s";
+                int    y       = _owner._vp.Bounds.Height - 24;
+                e.Display.Draw2dText(text, System.Drawing.Color.White,
+                    new Point2d(10, y), false, 13);
+            }
+        }
 
         // ─────────────────────────────────────────────────────────────────────
         public WalkGetter(RhinoDoc doc, RhinoView view)
@@ -152,8 +227,6 @@ namespace WalkMode
 
             _unitsPerMeter = RhinoMath.UnitScale(UnitSystem.Meters, _doc.ModelUnitSystem);
 
-            // Speed: reuse last session value if available, otherwise derive from
-            // camera distance (scene-aware) and clamp to a physical range.
             if (s_lastSpeed > 0)
             {
                 _baseSpeed = s_lastSpeed;
@@ -171,9 +244,6 @@ namespace WalkMode
             _yaw   = Math.Atan2(dir.X, dir.Y);
             _pitch = Math.Asin(Math.Max(-1.0, Math.Min(1.0, dir.Z)));
             _camPos = _vp.CameraLocation;
-            AcceptNothing(true);
-            PermitObjectSnap(false);
-            UpdatePrompt();
 
             BuildGeometryCache();
             _objHandler     = (s, e) => _geometryDirty = true;
@@ -187,17 +257,9 @@ namespace WalkMode
             RhinoDoc.LayerTableEvent        += _layerHandler;
 
             _lastBounds = _vp.Bounds;
-            // Near clip: 10 cm equivalent — close enough to walk past walls
-            // without clipping, far enough to avoid z-fighting.
             _nearClip = 0.1 * _unitsPerMeter;
             ComputeScreenCenter();
 
-            // Install global low-level keyboard + mouse hooks.
-            // These intercept input at the OS level, before any window (including
-            // Rhino's command line) can see it.  Returning IntPtr(-1) consumes the
-            // event so it never types "W" into the command line.
-            // The delegate MUST be stored in a field to prevent the GC from
-            // collecting it while the hook is installed.
             _hookProc = HookCallback;
             using (var proc = Process.GetCurrentProcess())
             using (var mod  = proc.MainModule)
@@ -209,14 +271,14 @@ namespace WalkMode
 
             _lastTickMs = _sw.ElapsedMilliseconds;
 
-            // 4 ms (250 Hz) for low-latency input.  Previously this caused lag
-            // because _view.Redraw() blocked the message pump.  Now we use
-            // InvalidateRect which returns instantly, so ticks are ~0.1 ms each.
-            // timeBeginPeriod(1) ensures the OS actually fires at 4 ms granularity.
             timeBeginPeriod(1);
             _timer = new System.Windows.Forms.Timer { Interval = 4 };
             _timer.Tick += OnTimerTick;
             _timer.Start();
+
+            // Enable display conduit for HUD drawing
+            _conduit = new WalkConduit(this);
+            _conduit.Enabled = true;
         }
 
         // ── Geometry cache ────────────────────────────────────────────────────
@@ -228,10 +290,6 @@ namespace WalkMode
             _geometryDirty = false;
         }
 
-        // Recursively collects geometry as meshes, expanding block instances.
-        // Breps/Surfaces contribute their pre-built render meshes (RhinoObject.GetMeshes)
-        // — no BVH build, no warmup needed.  Falls back to fast meshing for block
-        // members whose render meshes haven't been built yet.
         void CollectGeometry(IEnumerable<RhinoObject> objects, Transform xform,
                              List<Mesh> meshes)
         {
@@ -256,7 +314,6 @@ namespace WalkMode
                 else if (geom is Brep || geom is Surface)
                 {
                     source = obj.GetMeshes(MeshType.Render);
-                    // Fallback for block-definition objects that haven't been rendered yet.
                     if ((source == null || source.Length == 0) && geom is Brep brep)
                         source = Mesh.CreateFromBrep(brep, MeshingParameters.FastRenderMesh);
                 }
@@ -279,11 +336,8 @@ namespace WalkMode
             }
         }
 
-        // Closest mesh hit; null = no hit.
         Point3d? ShootRay(Ray3d ray)
         {
-            // Debounce: rebuild at most every 500 ms so a burst of doc-change events
-            // (layer toggle, object edit) doesn't cause a synchronous stall mid-walk.
             if (_geometryDirty)
             {
                 var now = DateTime.UtcNow;
@@ -315,9 +369,6 @@ namespace WalkMode
 
         void ComputeScreenCenter()
         {
-            // Use _vp.Bounds (viewport rect in view-window client coordinates),
-            // not _view.ClientRectangle, so the center lands in the active
-            // viewport even when the window contains multiple viewports.
             var bounds = _vp.Bounds;
             var pt = new System.Drawing.Point(
                 bounds.X + bounds.Width  / 2,
@@ -325,7 +376,7 @@ namespace WalkMode
             if (_view.Handle != IntPtr.Zero)
                 ClientToScreen(_view.Handle, ref pt);
             _screenCenter = pt;
-            _lastMousePt  = pt;   // reset reference to avoid a delta jump on resize
+            _lastMousePt  = pt;
         }
 
         void OnWheelDelta(int delta)
@@ -334,14 +385,10 @@ namespace WalkMode
             else           _baseSpeed /= 1.2;
             _baseSpeed = Math.Max(0.1 * _unitsPerMeter, Math.Min(_baseSpeed, 100.0 * _unitsPerMeter));
             s_lastSpeed = _baseSpeed;
-            UpdatePrompt();
+            _redrawPending = true;
         }
 
         // ── Low-level hook callback ───────────────────────────────────────────
-        // Called on every keyboard / mouse event system-wide, on the UI thread
-        // (because the hook was installed from the UI thread and the message pump
-        // is running inside GetPoint.Get()).
-        // Returning IntPtr(-1) consumes the event — Rhino never sees it.
         IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
         {
             if (nCode < 0)
@@ -378,8 +425,21 @@ namespace WalkMode
                         if (down && !_kSpaceDown) _spaceEdge = true;
                         _kSpaceDown = down;
                         break;
+                    case Keys.Escape:
+                        if (down)
+                        {
+                            _cancelled     = true;
+                            _exitRequested = true;
+                        }
+                        break;
+                    case Keys.Return:
+                        if (down)
+                        {
+                            _exitRequested = true;
+                        }
+                        break;
                     default:
-                        consume = false;    // pass Esc, Enter, etc. through to Rhino
+                        consume = false;
                         break;
                 }
 
@@ -394,19 +454,18 @@ namespace WalkMode
                 _lastMousePt = new System.Drawing.Point(data.pt.x, data.pt.y);
                 if (dx != 0 || dy != 0)
                 {
-                    // Just accumulate raw deltas — no Rhino API calls here.
-                    // The timer tick consumes these at 250 Hz (4 ms), applies
-                    // the camera once, and invalidates once.  Keeping the hook
-                    // ultra-light prevents it from starving WM_TIMER messages.
                     _mouseDx += dx;
                     _mouseDy += dy;
-
-                    // Warp cursor back to center so it never hits the screen edge.
-                    // Echo WM_MOUSEMOVE has dx=dy=0 → skipped, no cascade.
                     SetCursorPos(_screenCenter.X, _screenCenter.Y);
                     _lastMousePt = _screenCenter;
                 }
-                return new IntPtr(-1);   // consume — Rhino doesn't see cursor move
+                return new IntPtr(-1);
+            }
+            // ── Right-click → accept view ─────────────────────────────────────
+            else if (msg == WM_RBUTTONDOWN)
+            {
+                _exitRequested = true;
+                return new IntPtr(-1);
             }
             // ── Scroll wheel ──────────────────────────────────────────────────
             else if (msg == WM_MOUSEWHEEL)
@@ -421,9 +480,6 @@ namespace WalkMode
         }
 
         // ── Physics timer tick (250 Hz) ──────────────────────────────────────
-        // All input (mouse deltas, keyboard, gravity) is consumed here in one
-        // place.  ApplyCamera runs every tick something changed (~0.01 ms);
-        // Redraw is throttled so the synchronous render can't back up the queue.
         void OnTimerTick(object sender, EventArgs e)
         {
             // Force the Win32 cursor-display counter to exactly -1 (hidden).
@@ -466,39 +522,13 @@ namespace WalkMode
 
             if (moved) _redrawPending = true;
 
-            // Apply camera state every tick something changed (cheap).
-            // Redraw only when enough time has passed since the last frame
-            // completed — this leaves the message pump free to dispatch
-            // mouse hooks between frames while keeping a steady framerate.
             if (_redrawPending)
             {
+                _redrawPending = false;
                 ApplyCamera();
-
-                if (nowMs - _lastRedrawDoneMs >= 6)
-                {
-                    _redrawPending = false;
-                    _view.Redraw();
-                    _lastRedrawDoneMs = _sw.ElapsedMilliseconds;
-                }
+                AdjustNearClip();
+                _view.Redraw();
             }
-        }
-
-        // ── HUD draw ──────────────────────────────────────────────────────────
-        protected override void OnDynamicDraw(GetPointDrawEventArgs e)
-        {
-            base.OnDynamicDraw(e);
-            DrawCrosshair(e);
-            DrawStatus(e);
-        }
-
-        void DrawStatus(GetPointDrawEventArgs e)
-        {
-            double speedMs = _baseSpeed / _unitsPerMeter;
-            string grav    = _gravityEnabled ? "Gravity ON" : "Gravity OFF";
-            string text    = $"{grav}   Speed {speedMs:F1} m/s";
-            int    y       = _vp.Bounds.Height - 24;
-            e.Display.Draw2dText(text, System.Drawing.Color.White,
-                new Point2d(10, y), false, 13);
         }
 
         // ── Movement / physics ────────────────────────────────────────────────
@@ -544,8 +574,6 @@ namespace WalkMode
             if (_verticalVelocity < terminal) _verticalVelocity = terminal;
             _camPos.Z += _verticalVelocity * dt;
 
-            // Probe the floor at ~30 Hz rather than every tick.
-            // Between probes, snap against the cached floor height.
             const double ProbeHz = 30.0;
             _gravityProbeAccum += dt;
             if (_gravityProbeAccum >= 1.0 / ProbeHz)
@@ -568,8 +596,6 @@ namespace WalkMode
                 }
             }
 
-            // Only dirty the camera when Z actually moved — avoids a 60 Hz
-            // full-viewport redraw while the player is standing still on a floor.
             return Math.Abs(_camPos.Z - prevZ) > 1e-9;
         }
 
@@ -590,9 +616,6 @@ namespace WalkMode
 
         void BeginTeleport()
         {
-            // Use the GPU depth buffer — reads whatever Rhino has already rendered,
-            // so blocks, instances, meshes, NURBS, everything works automatically.
-            // No geometry cache needed, no ray-cast stall.
             Point3d hit;
             using (var zBuf = new ZBufferCapture(_vp))
             {
@@ -603,19 +626,17 @@ namespace WalkMode
 
             if (!hit.IsValid) return;
             double dist = _camPos.DistanceTo(hit);
-            if (dist < 0.1 * _unitsPerMeter) return;   // pointing at sky or self
+            if (dist < 0.1 * _unitsPerMeter) return;
 
             _teleportOrigin   = _camPos;
             _teleportTarget   = new Point3d(hit.X, hit.Y, hit.Z + 1.75 * _unitsPerMeter);
             _teleportStart    = DateTime.UtcNow;
-            // Scale duration with distance: ~60 ms for close hops, up to 150 ms.
             _teleportDuration = Math.Max(0.06, Math.Min(0.15, dist / (20.0 * _unitsPerMeter)));
             _teleporting      = true;
         }
 
         void ProcessToggles()
         {
-            // Tab → toggle gravity
             if (_tabEdge)
             {
                 _tabEdge = false;
@@ -625,10 +646,9 @@ namespace WalkMode
                     _verticalVelocity = 0;
                     _grounded = false;
                 }
-                UpdatePrompt();
+                _redrawPending = true;
             }
 
-            // V → jump (only when confirmed grounded by floor probe)
             if (_vEdge)
             {
                 _vEdge = false;
@@ -639,20 +659,11 @@ namespace WalkMode
                 }
             }
 
-            // Space → teleport
             if (_spaceEdge)
             {
                 _spaceEdge = false;
                 if (!_teleporting) BeginTeleport();
             }
-        }
-
-        void UpdatePrompt()
-        {
-            double speedMs = _baseSpeed / _unitsPerMeter;
-            string grav    = _gravityEnabled ? "Gravity ON" : "Gravity OFF";
-            SetCommandPrompt(
-                $"Walk  WASD·move  Mouse·look  Tab·{grav}  V·jump  Space·teleport  Speed·{speedMs:F1}m/s·(scroll)  Esc·exit");
         }
 
         Vector3d ReconstructCameraDirection()
@@ -667,10 +678,10 @@ namespace WalkMode
         {
             var dir = ReconstructCameraDirection();
             _vp.SetCameraLocations(_camPos + dir, _camPos);
+        }
 
-            // Force a walkthrough-friendly near clip plane.  Rhino's auto-
-            // calculation bases near/far on scene extents, which in mm or cm
-            // files pushes the near plane so far out that nearby walls clip.
+        void AdjustNearClip()
+        {
             var vi = new ViewportInfo(_vp);
             if (vi.FrustumNear > _nearClip * 2)
             {
@@ -679,63 +690,48 @@ namespace WalkMode
             }
         }
 
-        // ── Crosshair HUD ─────────────────────────────────────────────────────
-        void DrawCrosshair(GetPointDrawEventArgs e)
-        {
-            int cx = _vp.Bounds.Width  / 2;
-            int cy = _vp.Bounds.Height / 2;
-
-            const int   arm = 12;
-            const int   gap = 4;
-            const float thk = 1.5f;
-            var white = System.Drawing.Color.White;
-
-            e.Display.Draw2dLine(
-                new System.Drawing.PointF(cx,       cy - gap),
-                new System.Drawing.PointF(cx,       cy - gap - arm), white, thk);
-            e.Display.Draw2dLine(
-                new System.Drawing.PointF(cx,       cy + gap),
-                new System.Drawing.PointF(cx,       cy + gap + arm), white, thk);
-            e.Display.Draw2dLine(
-                new System.Drawing.PointF(cx - gap, cy),
-                new System.Drawing.PointF(cx - gap - arm, cy),       white, thk);
-            e.Display.Draw2dLine(
-                new System.Drawing.PointF(cx + gap, cy),
-                new System.Drawing.PointF(cx + gap + arm, cy),       white, thk);
-            e.Display.Draw2dLine(
-                new System.Drawing.PointF(cx - 1, cy),
-                new System.Drawing.PointF(cx + 1, cy), white, 2.0f);
-        }
-
         // ── Entry point ───────────────────────────────────────────────────────
-        internal GetResult RunWalk()
+        internal Result RunWalk()
         {
             if (!_vp.IsPerspectiveProjection)
             {
                 RhinoApp.WriteLine("WalkMode requires a perspective viewport.");
-                return GetResult.Cancel;
+                return Result.Cancel;
             }
 
-            // Position cursor at viewport center before Get() starts.
-            // Cursor hiding is deferred to the first timer tick — Get() internally
-            // calls ShowCursor(true) which undoes an early Cursor.Hide(), so we
-            // drain the Win32 reference count from inside the running message pump.
             SetCursorPos(_screenCenter.X, _screenCenter.Y);
 
-            GetResult result;
+            RhinoApp.SetCommandPrompt(
+                "Walk  WASD·move  Mouse·look  Tab·gravity  V·jump  Space·teleport  Scroll·speed  Esc·exit");
+
             try
             {
-                result = Get();
+                // Manual message pump — lightest possible loop.
+                // WaitMessage blocks efficiently until the OS has a message to deliver,
+                // so CPU usage is zero when idle.  The timer, hooks, and Rhino's own
+                // internal messages all fire normally within this pump.
+                while (!_exitRequested)
+                {
+                    while (PeekMessage(out var msg, IntPtr.Zero, 0, 0, PM_REMOVE))
+                    {
+                        TranslateMessage(ref msg);
+                        DispatchMessage(ref msg);
+                    }
+                    WaitMessage();
+                }
             }
             finally
             {
                 Cleanup();
             }
 
-            if (result == GetResult.Cancel)
+            if (_cancelled)
+            {
                 RestoreCamera();
+                return Result.Cancel;
+            }
 
-            return result;
+            return Result.Success;
         }
 
         void RestoreCamera()
@@ -749,25 +745,24 @@ namespace WalkMode
             if (_cleaned) return;
             _cleaned = true;
 
-            // Persist speed so the next run starts where this one left off.
             s_lastSpeed = _baseSpeed;
 
-            // Restore default OS timer resolution, then stop the physics timer.
+            // Disable display conduit
+            if (_conduit != null) { _conduit.Enabled = false; _conduit = null; }
+
             timeEndPeriod(1);
             if (_timer != null) { _timer.Stop(); _timer.Dispose(); _timer = null; }
 
-            // Uninstall global hooks — stop the callback from firing during teardown.
             if (_kHook != IntPtr.Zero) { UnhookWindowsHookEx(_kHook); _kHook = IntPtr.Zero; }
             if (_mHook != IntPtr.Zero) { UnhookWindowsHookEx(_mHook); _mHook = IntPtr.Zero; }
 
-            // Unsubscribe doc events
             RhinoDoc.AddRhinoObject         -= _objHandler;
             RhinoDoc.DeleteRhinoObject      -= _objHandler;
             RhinoDoc.ReplaceRhinoObject     -= _replaceHandler;
             RhinoDoc.ModifyObjectAttributes -= _attrHandler;
             RhinoDoc.LayerTableEvent        -= _layerHandler;
 
-            // Force cursor visible: restore Win32 display counter to exactly 0.
+            // Force cursor visible
             {
                 int c = ShowCursorWin32(true);
                 while (c < 0) c = ShowCursorWin32(true);
@@ -777,10 +772,9 @@ namespace WalkMode
             _meshGeometry = null;
         }
 
-        protected override void Dispose(bool disposing)
+        public void Dispose()
         {
-            if (disposing) Cleanup();
-            base.Dispose(disposing);
+            Cleanup();
         }
     }
 }
