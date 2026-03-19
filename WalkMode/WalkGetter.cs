@@ -35,9 +35,17 @@ namespace WalkMode
         [DllImport("user32.dll")]
         static extern IntPtr DispatchMessage(ref MSG lpMsg);
         [DllImport("user32.dll")]
-        static extern bool WaitMessage();
+        static extern uint MsgWaitForMultipleObjectsEx(
+            uint nCount,
+            IntPtr pHandles,
+            uint dwMilliseconds,
+            uint dwWakeMask,
+            uint dwFlags);
 
         const uint PM_REMOVE = 0x0001;
+        const uint INFINITE = 0xFFFFFFFF;
+        const uint QS_ALLINPUT = 0x04FF;
+        const uint MWMO_INPUTAVAILABLE = 0x0004;
 
         [StructLayout(LayoutKind.Sequential)]
         struct MSG
@@ -97,6 +105,8 @@ namespace WalkMode
         System.Drawing.Rectangle _lastBounds;
 
         // ── Frame timing ──────────────────────────────────────────────────────
+        const int FrameIntervalMs = 4;
+        const double LookSensitivity = 0.0025;
         readonly Stopwatch _sw = Stopwatch.StartNew();
         long _lastTickMs;
 
@@ -147,10 +157,12 @@ namespace WalkMode
         IntPtr       _mHook = IntPtr.Zero;
 
         // ── Physics/render timer ──────────────────────────────────────────────
-        System.Windows.Forms.Timer _timer;
 
         // ── Display conduit ───────────────────────────────────────────────────
         WalkConduit _conduit;
+
+        // ── Loading state ─────────────────────────────────────────────────────
+        bool _loading;
 
         // ── Disposal guard ────────────────────────────────────────────────────
         bool _cleaned;
@@ -173,6 +185,15 @@ namespace WalkMode
             protected override void DrawForeground(DrawEventArgs e)
             {
                 if (e.Viewport.Id != _vpId) return;
+
+                if (_owner._loading)
+                {
+                    int cx = _owner._vp.Bounds.Width  / 2;
+                    int cy = _owner._vp.Bounds.Height / 2;
+                    e.Display.Draw2dText("Loading geometry...",
+                        System.Drawing.Color.White, new Point2d(cx - 60, cy + 30), false, 15);
+                    return;
+                }
 
                 DrawCrosshair(e);
                 DrawStatus(e);
@@ -245,7 +266,29 @@ namespace WalkMode
             _pitch = Math.Asin(Math.Max(-1.0, Math.Min(1.0, dir.Z)));
             _camPos = _vp.CameraLocation;
 
+            _lastBounds = _vp.Bounds;
+            _nearClip = 0.1 * _unitsPerMeter;
+            ComputeScreenCenter();
+
+            // Install hooks early so keys are consumed during geometry loading
+            _hookProc = HookCallback;
+            using (var proc = Process.GetCurrentProcess())
+            using (var mod  = proc.MainModule)
+            {
+                var hMod = GetModuleHandle(mod.ModuleName);
+                _kHook = SetWindowsHookEx(WH_KEYBOARD_LL, _hookProc, hMod, 0);
+                _mHook = SetWindowsHookEx(WH_MOUSE_LL,    _hookProc, hMod, 0);
+            }
+
+            // Enable conduit before geometry load so "Loading..." is visible
+            _conduit = new WalkConduit(this);
+            _conduit.Enabled = true;
+            _loading = true;
+            _view.Redraw();
+
             BuildGeometryCache();
+            _loading = false;
+
             _objHandler     = (s, e) => _geometryDirty = true;
             _replaceHandler = (s, e) => _geometryDirty = true;
             _attrHandler    = (s, e) => _geometryDirty = true;
@@ -256,29 +299,9 @@ namespace WalkMode
             RhinoDoc.ModifyObjectAttributes += _attrHandler;
             RhinoDoc.LayerTableEvent        += _layerHandler;
 
-            _lastBounds = _vp.Bounds;
-            _nearClip = 0.1 * _unitsPerMeter;
-            ComputeScreenCenter();
-
-            _hookProc = HookCallback;
-            using (var proc = Process.GetCurrentProcess())
-            using (var mod  = proc.MainModule)
-            {
-                var hMod = GetModuleHandle(mod.ModuleName);
-                _kHook = SetWindowsHookEx(WH_KEYBOARD_LL, _hookProc, hMod, 0);
-                _mHook = SetWindowsHookEx(WH_MOUSE_LL,    _hookProc, hMod, 0);
-            }
-
             _lastTickMs = _sw.ElapsedMilliseconds;
 
             timeBeginPeriod(1);
-            _timer = new System.Windows.Forms.Timer { Interval = 4 };
-            _timer.Tick += OnTimerTick;
-            _timer.Start();
-
-            // Enable display conduit for HUD drawing
-            _conduit = new WalkConduit(this);
-            _conduit.Enabled = true;
         }
 
         // ── Geometry cache ────────────────────────────────────────────────────
@@ -343,7 +366,10 @@ namespace WalkMode
                 var now = DateTime.UtcNow;
                 if ((now - _lastGeometryRebuild).TotalSeconds >= 0.5)
                 {
+                    _loading = true;
+                    _view.Redraw();
                     BuildGeometryCache();
+                    _loading = false;
                     _lastGeometryRebuild = now;
                 }
             }
@@ -480,7 +506,7 @@ namespace WalkMode
         }
 
         // ── Physics timer tick (250 Hz) ──────────────────────────────────────
-        void OnTimerTick(object sender, EventArgs e)
+        void TickFrame(long nowMs)
         {
             // Force the Win32 cursor-display counter to exactly -1 (hidden).
             {
@@ -489,7 +515,6 @@ namespace WalkMode
                 while (c < -1) c = ShowCursorWin32(true);
             }
 
-            long   nowMs = _sw.ElapsedMilliseconds;
             double dt    = Math.Min((nowMs - _lastTickMs) / 1000.0, 0.1);
             _lastTickMs  = nowMs;
 
@@ -506,9 +531,8 @@ namespace WalkMode
             _mouseDx = 0; _mouseDy = 0;
             if (mdx != 0 || mdy != 0)
             {
-                const double sens = 0.002;
-                _yaw   += mdx * sens;
-                _pitch -= mdy * sens;
+                _yaw   += mdx * LookSensitivity;
+                _pitch -= mdy * LookSensitivity;
                 const double maxPitch = 89.0 * Math.PI / 180.0;
                 if (_pitch >  maxPitch) _pitch =  maxPitch;
                 if (_pitch < -maxPitch) _pitch = -maxPitch;
@@ -532,6 +556,15 @@ namespace WalkMode
         }
 
         // ── Movement / physics ────────────────────────────────────────────────
+        bool NeedsContinuousTick()
+        {
+            if (_teleporting) return true;
+            if (_gravityEnabled && !_grounded) return true;
+            if (_kW || _kA || _kS || _kD) return true;
+            if (!_gravityEnabled && (_kQ || _kE)) return true;
+            return false;
+        }
+
         bool ProcessKeyboardMovement(double dt)
         {
             double speed = _baseSpeed;
@@ -713,17 +746,45 @@ namespace WalkMode
             try
             {
                 // Manual message pump — lightest possible loop.
-                // WaitMessage blocks efficiently until the OS has a message to deliver,
-                // so CPU usage is zero when idle.  The timer, hooks, and Rhino's own
-                // internal messages all fire normally within this pump.
+                // Input now flushes a frame on the same message cycle, while
+                // movement and gravity continue on a paced 250 Hz loop.
+                long nextTickMs = _lastTickMs;
                 while (!_exitRequested)
                 {
+                    bool inputFrameRequested = false;
                     while (PeekMessage(out var msg, IntPtr.Zero, 0, 0, PM_REMOVE))
                     {
                         TranslateMessage(ref msg);
                         DispatchMessage(ref msg);
+
+                        if (_mouseDx != 0 || _mouseDy != 0 || _redrawPending)
+                        {
+                            inputFrameRequested = true;
+                            break;
+                        }
                     }
-                    WaitMessage();
+
+                    long nowMs = _sw.ElapsedMilliseconds;
+                    bool needsTick = NeedsContinuousTick();
+                    bool shouldTick = inputFrameRequested || _redrawPending || (needsTick && nowMs >= nextTickMs);
+
+                    if (shouldTick)
+                    {
+                        TickFrame(nowMs);
+                        nextTickMs = nowMs + FrameIntervalMs;
+                        continue;
+                    }
+
+                    uint waitMs = needsTick
+                        ? (uint)Math.Max(1L, nextTickMs - nowMs)
+                        : INFINITE;
+
+                    MsgWaitForMultipleObjectsEx(
+                        0,
+                        IntPtr.Zero,
+                        waitMs,
+                        QS_ALLINPUT,
+                        MWMO_INPUTAVAILABLE);
                 }
             }
             finally
@@ -757,7 +818,6 @@ namespace WalkMode
             if (_conduit != null) { _conduit.Enabled = false; _conduit = null; }
 
             timeEndPeriod(1);
-            if (_timer != null) { _timer.Stop(); _timer.Dispose(); _timer = null; }
 
             if (_kHook != IntPtr.Zero) { UnhookWindowsHookEx(_kHook); _kHook = IntPtr.Zero; }
             if (_mHook != IntPtr.Zero) { UnhookWindowsHookEx(_mHook); _mHook = IntPtr.Zero; }

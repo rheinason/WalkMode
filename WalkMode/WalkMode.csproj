@@ -12,11 +12,13 @@
     <TargetExt>.rhp</TargetExt>
     <NoWarn>NU1701</NoWarn>
     <UseWindowsForms>true</UseWindowsForms>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
   </PropertyGroup>
   
   <PropertyGroup>
     <!-- Specifies information for Assembly and Yak -->
-    <Version>1.0</Version>
+    <Version>1.0.1</Version>
+    <InformationalVersion>1.0.1</InformationalVersion>
     <Title>WalkMode</Title>
     <Company>rheinason</Company>
     <Description>First-person walkthrough mode with WASD movement, mouse look, gravity, teleport, and adjustable speed</Description>
